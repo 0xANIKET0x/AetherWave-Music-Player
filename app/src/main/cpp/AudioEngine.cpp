@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <atomic>
+#include <thread>
 #include "AudioDecoder.h"
 
 // Re-add global status message required by AudioDecoder.cpp
@@ -42,6 +43,17 @@ public:
         return oboe::DataCallbackResult::Continue;
     }
 
+    void onErrorAfterClose(oboe::AudioStream *audioStream, oboe::Result error) override {
+        if (error == oboe::Result::ErrorDisconnected) {
+            // The audio device was disconnected. We must recreate the stream.
+            // Android 8.1+ will automatically reroute if we just open a new stream.
+            // Since this runs on an Oboe thread, we must spawn a new thread to avoid deadlock.
+            std::thread([this]() {
+                start();
+            }).detach();
+        }
+    }
+
     void start() {
         if (stream) {
             oboe::StreamState state = stream->getState();
@@ -61,11 +73,23 @@ public:
         mTimeOffsetSeconds = 0.0;
         
         oboe::AudioStreamBuilder builder;
-        builder.setPerformanceMode(oboe::PerformanceMode::LowLatency)
-               ->setSharingMode(oboe::SharingMode::Shared) 
-               ->setFormat(oboe::AudioFormat::Float)
-               ->setChannelCount(2)
+        builder.setFormat(oboe::AudioFormat::Float)
+               ->setChannelCount(oboe::ChannelCount::Stereo)
                ->setCallback(this);
+
+        if (mAudiophileMode.load()) {
+            // Audiophile: probe native rate, exclusive DAC, fidelity priority
+            int nativeRate = decoder.probeSampleRate(currentPath, currentFd);
+            builder.setSampleRate(nativeRate)
+                   ->setFormatConversionAllowed(true)
+                   ->setSharingMode(oboe::SharingMode::Exclusive)
+                   ->setPerformanceMode(oboe::PerformanceMode::None);
+        } else {
+            // Standard: shared mixer, low latency, battery-friendly
+            builder.setFormatConversionAllowed(false)
+                   ->setSharingMode(oboe::SharingMode::Shared)
+                   ->setPerformanceMode(oboe::PerformanceMode::LowLatency);
+        }
 
         oboe::Result result = builder.openStream(stream);
         if (result != oboe::Result::OK || !stream) {
@@ -77,6 +101,19 @@ public:
 
         decoder.loadTrack(currentPath, stream->getSampleRate(), stream->getChannelCount(), currentFd);
         decoder.startDecoding();
+        
+        if (mPendingSeek > 0.0f) {
+            decoder.seekTo(mPendingSeek);
+            
+            // Adjust mTimeOffsetSeconds so getCurrentPosition is correct immediately
+            int32_t rate = stream->getSampleRate();
+            float speed = decoder.getSpeedFactor();
+            if (rate > 0) {
+                mTimeOffsetSeconds = static_cast<double>(mPendingSeek) - (static_cast<double>(stream->getFramesRead()) / rate) * speed;
+            }
+            
+            mPendingSeek = 0.0f;
+        }
         
         oboe::Result startResult = stream->requestStart();
         if (startResult != oboe::Result::OK) {
@@ -104,6 +141,7 @@ public:
     void loadTrack(const std::string& path, int fd) {
         currentPath = path;
         currentFd = fd;
+        mPendingSeek = 0.0f;
         mStatusMessage = "Engine: Track staged. Waiting for Play command.";
     }
 
@@ -119,6 +157,9 @@ public:
     }
 
     double getCurrentPosition() {
+        if (mPendingSeek > 0.0f) {
+            return static_cast<double>(mPendingSeek);
+        }
         if (stream) {
             int64_t frames = stream->getFramesRead();
             int32_t rate = stream->getSampleRate();
@@ -132,7 +173,10 @@ public:
     }
 
     void seekTo(float seconds) {
-        if (!stream) return;
+        if (!stream) {
+            mPendingSeek = seconds;
+            return;
+        }
         
         int64_t frames = stream->getFramesRead();
         int32_t rate = stream->getSampleRate();
@@ -154,6 +198,10 @@ public:
     void setEqBandGain(int index, float gain) { decoder.setEqBandGain(index, gain); }
     void setEqEnabled(bool enabled) { decoder.setEqEnabled(enabled); }
     void setForceMaxBitrate(bool force) { decoder.setForceMaxBitrate(force); }
+    void setAudiophileMode(bool enabled) {
+        mAudiophileMode.store(enabled);
+        decoder.setAudiophileMode(enabled);
+    }
     void setVolume(float volume) { mVolume.store(volume); }
     float getAmplitude() { return mCurrentAmplitude.load(); }
 
@@ -177,6 +225,8 @@ private:
     double mTimeOffsetSeconds = 0.0;
     std::atomic<float> mVolume{1.0f};
     std::atomic<float> mCurrentAmplitude{0.0f};
+    std::atomic<bool> mAudiophileMode{false};
+    float mPendingSeek = 0.0f;
 };
 
 extern "C" {
@@ -292,6 +342,10 @@ JNIEXPORT jstring JNICALL Java_com_aetherwave_player_NativeAudioEngine_getOutput
 
 JNIEXPORT void JNICALL Java_com_aetherwave_player_NativeAudioEngine_setForceMaxBitrate(JNIEnv *env, jobject thiz, jlong handle, jboolean force) {
     if (auto p = getEngine(handle)) p->setForceMaxBitrate(force);
+}
+
+JNIEXPORT void JNICALL Java_com_aetherwave_player_NativeAudioEngine_setAudiophileMode(JNIEnv *env, jobject thiz, jlong handle, jboolean enabled) {
+    if (auto p = getEngine(handle)) p->setAudiophileMode(enabled);
 }
 
 }

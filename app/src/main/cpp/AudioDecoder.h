@@ -38,6 +38,7 @@ public:
     ~AudioDecoder();
 
     bool loadTrack(const std::string& path, int targetSampleRate, int targetChannels, int fd = -1);
+    int probeSampleRate(const std::string& path, int fd);
     void startDecoding();
     void stopDecoding();
     
@@ -48,6 +49,9 @@ public:
     float getSpeedFactor() const { return currentSpeedFactor.load(); }
     
     void setEffectMode(int mode);
+    void setAudiophileMode(bool enabled) { audiophileMode.store(enabled); }
+    std::atomic<bool> audiophileMode{false};
+    double panPhase = 0.0;
     std::atomic<int> inputBitrate{0};
     std::atomic<int> inputBitDepth{0};
     std::atomic<bool> isDolbyAtmos{false};

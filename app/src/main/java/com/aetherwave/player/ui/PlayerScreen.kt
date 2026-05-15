@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.HorizontalDivider as Divider
 import androidx.compose.runtime.*
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
@@ -497,15 +498,15 @@ fun TrackInfoDialog(track: Track?, deviceInfo: String, bitrate: Int, isAtmos: Bo
         title = { Text("Track Information", color = Color.White) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                InfoRow("Title", track?.title ?: "Unknown")
-                InfoRow("Artist", track?.artist ?: "Unknown")
-                InfoRow("Album", track?.album ?: "Unknown")
+                MetadataInfoRow("Title", track?.title ?: "Unknown")
+                MetadataInfoRow("Artist", track?.artist ?: "Unknown")
+                MetadataInfoRow("Album", track?.album ?: "Unknown")
                 Divider(color = Color.White.copy(alpha = 0.1f))
-                InfoRow("Format", if (bitrate >= 1411200) "Lossless (Hi-Res)" else "Standard")
-                InfoRow("Bitrate", "${bitrate / 1000} kbps")
-                InfoRow("Sample Rate", "${track?.sampleRate ?: 0} Hz")
-                InfoRow("Channels", if (isAtmos) "Dolby Atmos (Spatial)" else "${track?.channelCount ?: 2} Channels")
-                InfoRow("Output Device", deviceInfo.ifBlank { "System Speakers" })
+                MetadataInfoRow("Format", if (bitrate >= 1411200) "Lossless (Hi-Res)" else "Standard")
+                MetadataInfoRow("Bitrate", "${bitrate / 1000} kbps")
+                MetadataInfoRow("Sample Rate", "${track?.sampleRate ?: 0} Hz")
+                MetadataInfoRow("Channels", if (isAtmos) "Dolby Atmos (Spatial)" else "${track?.channelCount ?: 2} Channels")
+                MetadataInfoRow("Output Device", deviceInfo.ifBlank { "System Speakers" })
                 Divider(color = Color.White.copy(alpha = 0.1f))
                 Text("File Path:", style = MaterialTheme.typography.labelMedium, color = Color.White.copy(alpha = 0.5f))
                 Text(track?.filePath ?: "N/A", style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.7f))
@@ -517,7 +518,7 @@ fun TrackInfoDialog(track: Track?, deviceInfo: String, bitrate: Int, isAtmos: Bo
 }
 
 @Composable
-fun InfoRow(label: String, value: String) {
+fun MetadataInfoRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Text(label, color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.bodyMedium)
         Text(value, color = Color.White, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)

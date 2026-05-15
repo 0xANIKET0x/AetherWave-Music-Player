@@ -33,12 +33,14 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
@@ -87,6 +89,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
 
         val intent = Intent(this, PlaybackService::class.java)
         try {
@@ -119,11 +122,27 @@ class MainActivity : ComponentActivity() {
                 currentService.value = playbackService
             }
 
+            val coroutineScope = rememberCoroutineScope()
+            val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+                uri?.let {
+                    contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    playlistStore.addManualFolder(it.toString())
+                }
+            }
+
+
+
             AetherWaveTheme(theme = currentTheme) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val service = currentService.value
                     if (service != null) {
-                        AetherWaveApp(service, this@MainActivity, playlistStore, currentTheme) {
+                        AetherWaveApp(
+                            service, 
+                            this@MainActivity, 
+                            playlistStore, 
+                            currentTheme,
+                            onAddFolder = { folderPicker.launch(null) }
+                        ) {
                             val themes = listOf("DARK", "MIDNIGHT", "EMERALD", "LAVENDER", "LIGHT")
                             val next = themes[(themes.indexOf(currentTheme) + 1) % themes.size]
                             playlistStore.setTheme(next)
@@ -134,6 +153,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
 
     override fun onDestroy() {
@@ -153,9 +177,11 @@ fun AetherWaveApp(
     context: Context,
     playlistStore: PlaylistStore,
     currentTheme: String,
+    onAddFolder: () -> Unit,
     onThemeToggle: () -> Unit
 ) {
     // Backup UI logic
+    val view = androidx.compose.ui.platform.LocalView.current
     val coroutineScope = rememberCoroutineScope()
     val backupRepo = remember { BackupRepository(context) }
     
@@ -194,6 +220,7 @@ fun AetherWaveApp(
         }
     }
     var currentScreen by rememberSaveable { mutableStateOf(Screen.LIBRARY) }
+    var previousScreen by rememberSaveable { mutableStateOf(Screen.LIBRARY) }
     var selectedDetailTracks by remember { mutableStateOf<List<Track>>(emptyList()) }
     var selectedDetailTitle by remember { mutableStateOf("") }
 
@@ -205,23 +232,7 @@ fun AetherWaveApp(
     var isScanning by remember { mutableStateOf(false) }
     var hasPermission by remember { mutableStateOf(false) }
 
-    val view = LocalView.current
-    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        uri?.let {
-            context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            playlistStore.addManualFolder(it.toString())
-            // Trigger a scan in the background
-            coroutineScope.launch(Dispatchers.IO) {
-                isScanning = true
-                val repo = MediaRepository(context)
-                val tracks = repo.scanAllTracks(allRawTracks, playlistStore.getManualFolders())
-                allRawTracks = tracks
-                allFolders = tracks.map { it.filePath.substringBeforeLast("/") }.distinct().sorted()
-                repo.saveTracksToCache(tracks)
-                isScanning = false
-            }
-        }
-    }
+
 
     LaunchedEffect(currentScreen) {
         val window = (context as? android.app.Activity)?.window ?: return@LaunchedEffect
@@ -231,6 +242,62 @@ fun AetherWaveApp(
             controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         } else {
             controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    // Handle intent-based navigation (e.g. from notification or file manager)
+    val currentIntent = (context as? android.app.Activity)?.intent
+    LaunchedEffect(currentIntent) {
+        if (currentIntent?.getBooleanExtra("OPEN_PLAYER", false) == true) {
+            currentScreen = Screen.PLAYER
+            // Clear the extra so we don't keep jumping back
+            currentIntent.removeExtra("OPEN_PLAYER")
+        }
+        
+        if (currentIntent?.action == Intent.ACTION_VIEW) {
+            val uri = currentIntent.data
+            if (uri != null) {
+                var realPath: String? = null
+                if (uri.scheme == "file") {
+                    realPath = uri.path
+                } else if (uri.scheme == "content") {
+                    try {
+                        val cursor = context.contentResolver.query(uri, arrayOf(android.provider.MediaStore.MediaColumns.DATA), null, null, null)
+                        if (cursor != null && cursor.moveToFirst()) {
+                            val dataIndex = cursor.getColumnIndex(android.provider.MediaStore.MediaColumns.DATA)
+                            if (dataIndex != -1) {
+                                realPath = cursor.getString(dataIndex)
+                            }
+                            cursor.close()
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+                
+                if (realPath != null) {
+                    val track = Track(
+                        id = realPath.hashCode().toLong(),
+                        title = realPath.substringAfterLast("/"),
+                        artist = "Unknown Artist",
+                        album = "Unknown Album",
+                        albumArtUri = null,
+                        filePath = realPath,
+                        duration = 0,
+                        bitrate = 0,
+                        sampleRate = 0,
+                        channelCount = 2,
+                        isHighRes = false,
+                        isAtmos = false
+                    )
+                    playbackService.setQueue(listOf(track), 0)
+                    previousScreen = currentScreen
+                    currentScreen = Screen.PLAYER
+                    
+                    // Consume the intent so it doesn't re-trigger
+                    currentIntent.action = Intent.ACTION_MAIN
+                }
+            }
         }
     }
 
@@ -306,13 +373,16 @@ fun AetherWaveApp(
         }
     }
 
+    val saveableStateHolder = rememberSaveableStateHolder()
+
     Box(modifier = Modifier.fillMaxSize()) {
-        when (currentScreen) {
-            Screen.PLAYER -> {
+        saveableStateHolder.SaveableStateProvider(currentScreen) {
+            when (currentScreen) {
+                Screen.PLAYER -> {
                 PlayerScreen(
                     playbackService = playbackService,
                     playlistStore = playlistStore,
-                    onBack = { currentScreen = Screen.LIBRARY },
+                    onBack = { currentScreen = previousScreen },
                     onLyricsClick = { currentScreen = Screen.LYRICS }
                 )
             }
@@ -327,14 +397,18 @@ fun AetherWaveApp(
                 SettingsScreen(
                     playlistStore = playlistStore,
                     allFolders = allFolders,
-                    onAddFolder = { folderPicker.launch(null) },
+                    isAudiophileMode = playbackService.audiophileMode.collectAsState().value,
+                    onAddFolder = onAddFolder,
                     onExport = { exportLauncher.launch("AetherWave_Backup_${System.currentTimeMillis()}.zip") },
                     onImport = { actualImportLauncher.launch(arrayOf("application/zip")) },
                     onForceMaxBitrateChange = { playbackService.setForceMaxBitrate(it) },
+                    onAudiophileModeChange = { playbackService.setAudiophileMode(it) },
                     onBack = { currentScreen = Screen.LIBRARY }
                 )
             }
+
             Screen.ALBUM_DETAILS -> {
+                val albumListState = rememberLazyListState()
                 BackHandler { currentScreen = Screen.LIBRARY }
                 Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
                     // Header
@@ -353,10 +427,11 @@ fun AetherWaveApp(
                     }
                     
                     // Track List
-                    LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 100.dp)) {
+                    LazyColumn(modifier = Modifier.fillMaxSize(), state = albumListState, contentPadding = PaddingValues(bottom = 100.dp)) {
                         itemsIndexed(selectedDetailTracks) { index, track ->
                             com.aetherwave.player.ui.TrackRow(track, index + 1) {
                                 playbackService.setQueue(selectedDetailTracks, index)
+                                previousScreen = currentScreen
                                 currentScreen = Screen.PLAYER
                             }
                         }
@@ -369,6 +444,7 @@ fun AetherWaveApp(
                     allTracks = allTracks,
                     onTrackClick = { tracks, index ->
                         playbackService.setQueue(tracks, index)
+                        previousScreen = currentScreen
                         currentScreen = Screen.PLAYER
                     },
                     onBack = { currentScreen = Screen.LIBRARY }
@@ -431,6 +507,7 @@ fun AetherWaveApp(
                             playlistStore = playlistStore,
                             onTrackClick = { tracks, index ->
                                 playbackService.setQueue(tracks, index)
+                                previousScreen = currentScreen
                                 currentScreen = Screen.PLAYER
                             },
                             onDetailsClick = { title, tracks ->
@@ -451,5 +528,6 @@ fun AetherWaveApp(
                 }
             }
         }
+    }
     }
 }

@@ -1,6 +1,7 @@
 #include "AudioDecoder.h"
 #include <android/log.h>
 #include <cmath>
+#include <unistd.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -95,6 +96,52 @@ void AudioDecoder::setEqBandGain(int index, float gain) {
         eqBands[index].store(gain);
         pendingEqUpdate.store(true);
     }
+}
+
+int AudioDecoder::probeSampleRate(const std::string& path, int fd) {
+    FILE* fileHandle = nullptr;
+    if (fd >= 0) {
+        fileHandle = fdopen(dup(fd), "rb");
+    } else {
+        fileHandle = fopen(path.c_str(), "rb");
+    }
+    if (!fileHandle) return 48000;
+
+    const int avio_buffer_size = 4096;
+    unsigned char* avio_buffer = (unsigned char*)av_malloc(avio_buffer_size);
+    AVIOContext* avioContext = avio_alloc_context(avio_buffer, avio_buffer_size,
+                                                  0, fileHandle,
+                                                  &custom_read_packet, nullptr, &custom_seek_packet);
+    if (!avioContext) {
+        fclose(fileHandle);
+        return 48000;
+    }
+
+    AVFormatContext* formatContext = avformat_alloc_context();
+    formatContext->pb = avioContext;
+
+    int sr = 48000;
+    if (avformat_open_input(&formatContext, nullptr, nullptr, nullptr) >= 0) {
+        if (avformat_find_stream_info(formatContext, nullptr) >= 0) {
+            for (unsigned int i = 0; i < formatContext->nb_streams; i++) {
+                if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    sr = formatContext->streams[i]->codecpar->sample_rate;
+                    break;
+                }
+            }
+        }
+        // avformat_close_input frees the AVIO buffer internally
+        avioContext->buffer = nullptr;
+        avformat_close_input(&formatContext);
+    } else {
+        av_free(avioContext->buffer);
+        avformat_free_context(formatContext);
+    }
+    avio_context_free(&avioContext);
+    fclose(fileHandle);
+    
+    if (sr <= 0) sr = 48000;
+    return sr;
 }
 
 bool AudioDecoder::loadTrack(const std::string& path, int targetSampleRate, int targetChannels, int fd) {
@@ -265,7 +312,12 @@ bool AudioDecoder::initFilterGraph(AVCodecContext* codecCtx, AVRational time_bas
 void AudioDecoder::decodeLoop() {
     FILE* fileHandle = nullptr;
     if (currentFd >= 0) {
-        fileHandle = fdopen(currentFd, "rb");
+        int dupFd = dup(currentFd);
+        if (dupFd < 0) {
+            g_statusMessage = "FFmpeg Err: dup(fd) failed";
+            return;
+        }
+        fileHandle = fdopen(dupFd, "rb");
     } else {
         fileHandle = fopen(currentPath.c_str(), "rb");
     }
@@ -396,6 +448,12 @@ void AudioDecoder::decodeLoop() {
         if (mode == 3) speedFactor = 0.90; // Lofi approximation
 
         currentSpeedFactor.store(static_cast<float>(speedFactor));
+
+        // Audiophile Mode: match input rate exactly (no resampling)
+        // Standard Mode: use Oboe-provided rate (allows OS-level optimization)
+        if (audiophileMode.load()) {
+            sampleRate = codecContext->sample_rate;
+        }
 
         av_opt_set_int(swrCtx, "in_sample_rate", static_cast<int>(codecContext->sample_rate * speedFactor), 0);
         av_opt_set_sample_fmt(swrCtx, "in_sample_fmt", codecContext->sample_fmt, 0);
@@ -537,7 +595,6 @@ void AudioDecoder::decodeLoop() {
 
                     // Master Hack 2: Native C++ 3D Spatial Audio & 8D Panning
                     if (currentEffectMode.load() == 4 && channels == 2) {
-                        static double panPhase = 0.0;
                         double frequency = 0.125; 
                         double phaseIncrement = (2.0 * M_PI * frequency) / sampleRate;
                         
@@ -603,8 +660,12 @@ void AudioDecoder::decodeLoop() {
                                 sampleL = eqFilters[0][b].process(sampleL);
                                 sampleR = eqFilters[1][b].process(sampleR);
                             }
-                            if (sampleL > 1.0f) sampleL = 1.0f; else if (sampleL < -1.0f) sampleL = -1.0f;
-                            if (sampleR > 1.0f) sampleR = 1.0f; else if (sampleR < -1.0f) sampleR = -1.0f;
+                            // Standard Mode: soft-clip to protect speakers
+                            // Audiophile Mode: pure pass-through (no limiting)
+                            if (!audiophileMode.load()) {
+                                if (sampleL > 1.0f) sampleL = 1.0f; else if (sampleL < -1.0f) sampleL = -1.0f;
+                                if (sampleR > 1.0f) sampleR = 1.0f; else if (sampleR < -1.0f) sampleR = -1.0f;
+                            }
                             pcmData[i * 2] = sampleL;
                             pcmData[i * 2 + 1] = sampleR;
                         }

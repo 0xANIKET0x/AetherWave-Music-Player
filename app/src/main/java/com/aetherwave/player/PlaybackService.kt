@@ -19,6 +19,7 @@ import android.os.IBinder
 import com.aetherwave.player.data.CoverArtRepository
 import com.aetherwave.player.data.LyricLine
 import com.aetherwave.player.data.LyricsRepository
+import com.aetherwave.player.data.MediaRepository
 import com.aetherwave.player.data.Track
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +47,7 @@ class PlaybackService : Service() {
     val outputDeviceInfo = MutableStateFlow("")
     val amplitude = MutableStateFlow(0.0f)
     val audioEnergy = MutableStateFlow(0f)
+    val audiophileMode = MutableStateFlow(false)
     private var smoothedAmplitude = 0f
 
     val queueManager = QueueManager()
@@ -60,7 +62,7 @@ class PlaybackService : Service() {
     
     val dominantColor = MutableStateFlow<Int?>(null)
     val vibrantColor = MutableStateFlow<Int?>(null)
-    val lyricsMode = MutableStateFlow(0) // 0: Classic, 1: Synced, 2: Modern/Poster
+    val lyricsMode = MutableStateFlow(0) // 0: Apple Mesh, 1: 3D Kinetic Snow, 2: The Black Hole Book
 
     private val coverArtRepo = CoverArtRepository(this)
     private val lyricsRepo = LyricsRepository(this)
@@ -74,6 +76,14 @@ class PlaybackService : Service() {
     private var isAdvancing = false
     private var isRerouting = false
     private var lastSeekTime = 0L 
+
+    private val noisyReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                pauseTrack()
+            }
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): PlaybackService = this@PlaybackService
@@ -108,6 +118,8 @@ class PlaybackService : Service() {
 
         // Prevent ForegroundServiceDidNotStartInTimeException by starting immediately
         startForeground(1, createNotification())
+
+        registerReceiver(noisyReceiver, android.content.IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
 
         // Register device change callback for seamless audio routing
         audioManager.registerAudioDeviceCallback(object : AudioDeviceCallback() {
@@ -155,6 +167,7 @@ class PlaybackService : Service() {
                     if (isPlaying.value) {
                         updatePlaybackState(PlaybackState.STATE_PLAYING)
                     }
+                    savePlayerState()
                     lastInfoPoll = now
                 }
 
@@ -169,16 +182,26 @@ class PlaybackService : Service() {
                     if (isCrossfadeEnabled) {
                         isCrossfading = true
                         serviceScope.launch {
+                            try {
                             val fadeOutEngine = activeEngine
                             fadingEngine = fadeOutEngine
                             activeEngine = NativeAudioEngine()
                             
                             activeEngine.setEffectMode(currentEffectMode.value)
                             activeEngine.setEqEnabled(eqEnabled.value)
-                            eqGains.value.forEachIndexed { i, gain -> activeEngine.setEqBandGain(i, gain) }
+                            activeEngine.setAudiophileMode(audiophileMode.value)
+                            eqGains.value.forEachIndexed { i, gain -> if (i < 5) activeEngine.setEqBandGain(i, gain) }
 
                             queueManager.moveToNext(true)
-                        val nextTrack = queueManager.currentTrack.value!!
+                            val nextTrack = queueManager.currentTrack.value ?: run {
+                                // Queue emptied mid-crossfade — abort gracefully
+                                activeEngine.release()
+                                activeEngine = fadeOutEngine
+                                fadingEngine = null
+                                isCrossfading = false
+                                isAdvancing = false
+                                return@launch
+                            }
                         currentTrackPath.value = nextTrack.filePath
                         
                         coverArtUrl.value = null
@@ -205,15 +228,21 @@ class PlaybackService : Service() {
                             fadeOutEngine.stop()
                             fadeOutEngine.release()
                             fadingEngine = null
-                            isAdvancing = false
-                            isCrossfading = false
+                            } finally {
+                                isAdvancing = false
+                                isCrossfading = false
+                            }
                         }
                     }
                 }
 
                 if (isPlaying.value && !isAdvancing && !isCrossfading && status.contains("EOF")) {
                     isAdvancing = true
-                    onTrackCompleted()
+                    try {
+                        onTrackCompleted()
+                    } finally {
+                        isAdvancing = false
+                    }
                 }
                 
                 delay(50)
@@ -245,6 +274,9 @@ class PlaybackService : Service() {
         fadingEngine?.stop()
         fadingEngine?.release()
         abandonAudioFocus()
+        try {
+            unregisterReceiver(noisyReceiver)
+        } catch (e: Exception) {}
     }
 
     fun loadTrack(path: String) {
@@ -258,6 +290,11 @@ class PlaybackService : Service() {
         val path = currentTrackPath.value ?: run { isRerouting = false; return }
         val savedPosition = currentPosition.value.toFloat()
         serviceScope.launch {
+            kotlinx.coroutines.delay(200) // Allow AUDIO_BECOMING_NOISY to process and pause if necessary
+            if (!isPlaying.value) {
+                isRerouting = false
+                return@launch
+            }
             try {
                 activeEngine.stop()
                 kotlinx.coroutines.delay(150) // Brief pause for route to settle
@@ -304,7 +341,14 @@ class PlaybackService : Service() {
     }
 
     private fun onTrackCompleted() {
+        val trackBefore = queueManager.currentTrack.value
         if (queueManager.moveToNext(isAutoAdvance = true)) {
+            val trackAfter = queueManager.currentTrack.value
+            if (trackBefore != null && trackBefore.filePath == trackAfter?.filePath) {
+                activeEngine.stop()
+                activeEngine.loadTrack(trackAfter.filePath)
+                currentPosition.value = 0.0
+            }
             playTrack()
         } else {
             isPlaying.value = false
@@ -392,6 +436,29 @@ class PlaybackService : Service() {
 
     fun setForceMaxBitrate(force: Boolean) {
         activeEngine.setForceMaxBitrate(force)
+    }
+
+    fun setAudiophileMode(enabled: Boolean) {
+        audiophileMode.value = enabled
+        activeEngine.setAudiophileMode(enabled)
+        getSharedPreferences("aetherwave_audio", Context.MODE_PRIVATE).edit()
+            .putBoolean("audiophile_mode", enabled).apply()
+        
+        // Hot-restart the stream so the new Oboe configuration takes effect
+        if (isPlaying.value) {
+            val path = currentTrackPath.value ?: return
+            val savedPosition = currentPosition.value.toFloat()
+            serviceScope.launch {
+                activeEngine.stop()
+                delay(100)
+                activeEngine.loadTrack(path)
+                activeEngine.start()
+                if (savedPosition > 0.5f) {
+                    activeEngine.seekTo(savedPosition)
+                }
+                isPlaying.value = true
+            }
+        }
     }
 
     fun setEqBandGain(index: Int, gainDb: Float) {
@@ -509,11 +576,21 @@ class PlaybackService : Service() {
         val trackTitle = track?.title ?: currentTrackPath.value?.substringAfterLast("/") ?: "Ready"
         val trackArtist = track?.artist ?: ""
 
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("OPEN_PLAYER", true)
+        }
+        val contentIntent = PendingIntent.getActivity(
+            this, 0, openAppIntent, 
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val builder = Notification.Builder(this, "AETHER_WAVE_CHANNEL")
             .setContentTitle(trackTitle)
             .setContentText(trackArtist)
             .setSmallIcon(android.R.drawable.ic_media_play) 
             .setStyle(mediaStyle)
+            .setContentIntent(contentIntent)
             .addAction(playPauseAction)
             .addAction(nextAction)
             .setOngoing(isPlaying.value)
@@ -649,10 +726,9 @@ class PlaybackService : Service() {
         try {
             val gainStr = audioPrefs.getString("eq_gains", "0,0,0,0,0") ?: "0,0,0,0,0"
             val gains = gainStr.split(",").map { it.toFloat() }.toFloatArray()
-            // Support both 5 and 10 band EQ just in case
             if (gains.size >= 5) {
                 eqGains.value = gains
-                gains.forEachIndexed { i, g -> activeEngine.setEqBandGain(i, g) }
+                for (i in 0 until minOf(gains.size, 5)) { activeEngine.setEqBandGain(i, gains[i]) }
             }
         } catch (_: Throwable) {}
 
@@ -669,6 +745,75 @@ class PlaybackService : Service() {
             eqEnabled.value = enabled
             activeEngine.setEqEnabled(enabled)
         } catch (_: Throwable) {}
+
+        // Load Audiophile Mode
+        try {
+            val isAudiophile = audioPrefs.getBoolean("audiophile_mode", false)
+            audiophileMode.value = isAudiophile
+            activeEngine.setAudiophileMode(isAudiophile)
+        } catch (_: Throwable) {}
+        
+        restorePlayerState()
+    }
+
+    private fun savePlayerState() {
+        if (queueManager.currentQueue.value.isEmpty()) return
+        serviceScope.launch(Dispatchers.IO) {
+            val prefs = getSharedPreferences("aetherwave_state", Context.MODE_PRIVATE)
+            val origQ = queueManager.originalQueue.map { it.filePath }.joinToString("|")
+            val currQ = queueManager.currentQueue.value.map { it.filePath }.joinToString("|")
+            
+            prefs.edit()
+                .putString("orig_queue", origQ)
+                .putString("curr_queue", currQ)
+                .putInt("curr_index", queueManager.currentIndex.value)
+                .putFloat("curr_pos", currentPosition.value.toFloat())
+                .putBoolean("shuffle", queueManager.shuffleEnabled.value)
+                .putInt("repeat", queueManager.repeatMode.value)
+                .apply()
+        }
+    }
+
+    private fun restorePlayerState() {
+        val prefs = getSharedPreferences("aetherwave_state", Context.MODE_PRIVATE)
+        val origQStr = prefs.getString("orig_queue", "") ?: ""
+        val currQStr = prefs.getString("curr_queue", "") ?: ""
+        if (origQStr.isEmpty() || currQStr.isEmpty()) return
+        
+        serviceScope.launch(Dispatchers.IO) {
+            val repo = MediaRepository(this@PlaybackService)
+            val cachedTracks = repo.loadCachedTracks().associateBy { it.filePath }
+            
+            val origTracks = origQStr.split("|").mapNotNull { cachedTracks[it] }
+            val currTracks = currQStr.split("|").mapNotNull { cachedTracks[it] }
+            
+            if (origTracks.isNotEmpty() && currTracks.isNotEmpty()) {
+                val idx = prefs.getInt("curr_index", 0)
+                val pos = prefs.getFloat("curr_pos", 0f)
+                val shuffle = prefs.getBoolean("shuffle", false)
+                val repeat = prefs.getInt("repeat", 0)
+                
+                withContext(Dispatchers.Main) {
+                    queueManager.restoreState(origTracks, currTracks, idx, shuffle, repeat)
+                    val track = queueManager.currentTrack.value
+                    if (track != null) {
+                        currentTrackPath.value = track.filePath
+                        coverArtUrl.value = null
+                        lyrics.value = null
+                        activeEngine.loadTrack(track.filePath)
+                        activeEngine.seekTo(pos)
+                        currentPosition.value = pos.toDouble()
+                        duration.value = track.duration.toDouble() / 1000.0
+                        updateMediaMetadata()
+                        updatePlaybackState(PlaybackState.STATE_PAUSED)
+                        updateNotification()
+                        
+                        launch { coverArtUrl.value = coverArtRepo.fetchCoverArtUrl(track.title, track.artist) }
+                        launch { lyrics.value = lyricsRepo.fetchLyrics(track.title, track.artist) }
+                    }
+                }
+            }
+        }
     }
 }
 

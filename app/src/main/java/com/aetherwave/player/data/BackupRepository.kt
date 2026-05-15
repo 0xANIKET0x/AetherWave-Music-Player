@@ -12,8 +12,9 @@ class BackupRepository(private val context: Context) {
 
     fun exportBackup(uri: Uri): Boolean {
         return try {
-            context.contentResolver.openOutputStream(uri)?.use { os ->
-                ZipOutputStream(BufferedOutputStream(os)).use { zos ->
+            val os = context.contentResolver.openOutputStream(uri) ?: return false
+            os.use { stream ->
+                ZipOutputStream(BufferedOutputStream(stream)).use { zos ->
                     // 1. Export SharedPreferences
                     exportPrefs(zos, "aetherwave_playlists", "playlists.json")
                     exportPrefs(zos, "aetherwave_audio", "audio_settings.json")
@@ -21,6 +22,8 @@ class BackupRepository(private val context: Context) {
                     // 2. Export Media Cache
                     exportDir(zos, File(context.cacheDir, "covers"), "covers/")
                     exportDir(zos, File(context.cacheDir, "lyrics"), "lyrics/")
+                    
+                    zos.finish()
                 }
             }
             true
@@ -32,7 +35,8 @@ class BackupRepository(private val context: Context) {
 
     fun importBackup(uri: Uri): Boolean {
         return try {
-            context.contentResolver.openInputStream(uri)?.use { `is` ->
+            val input = context.contentResolver.openInputStream(uri) ?: return false
+            input.use { `is` ->
                 ZipInputStream(BufferedInputStream(`is`)).use { zis ->
                     var entry: ZipEntry? = zis.getNextEntry()
                     while (entry != null) {
@@ -115,7 +119,7 @@ class BackupRepository(private val context: Context) {
         dir.listFiles()?.forEach { file ->
             if (file.isFile) {
                 zos.putNextEntry(ZipEntry(zipPrefix + file.name))
-                file.inputStream().copyTo(zos)
+                file.inputStream().use { it.copyTo(zos) }
                 zos.closeEntry()
             }
         }

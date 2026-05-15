@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -37,7 +38,9 @@ fun SearchScreen(
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+    val searchListState = rememberLazyListState()
+
+    Column(modifier = Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
         // Search Header
         Row(
             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -97,6 +100,7 @@ fun SearchScreen(
         } else {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
+                state = searchListState,
                 contentPadding = PaddingValues(bottom = 100.dp)
             ) {
                 item {

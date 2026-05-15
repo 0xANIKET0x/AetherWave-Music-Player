@@ -10,7 +10,8 @@ class QueueManager {
     val shuffleEnabled = MutableStateFlow(false)
     val repeatMode = MutableStateFlow(0) // 0: None, 1: All, 2: One
 
-    private var originalQueue: List<Track> = emptyList()
+    var originalQueue: List<Track> = emptyList()
+        private set
 
     fun setQueue(tracks: List<Track>, startIndex: Int) {
         originalQueue = tracks
@@ -30,6 +31,15 @@ class QueueManager {
             currentQueue.value = tracks
             currentIndex.value = startIndex
         }
+        updateCurrentTrack()
+    }
+
+    fun restoreState(original: List<Track>, current: List<Track>, index: Int, shuffle: Boolean, repeat: Int) {
+        originalQueue = original
+        shuffleEnabled.value = shuffle
+        repeatMode.value = repeat
+        currentQueue.value = current
+        currentIndex.value = index
         updateCurrentTrack()
     }
 
