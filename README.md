@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp" alt="AetherWave Logo" width="120" />
+  <img src="app/src/main/res/drawable/splash_logo.png" alt="AetherWave Logo" width="120" />
   <h1>AetherWave Music Player 🌊</h1>
   <p><strong>A Premium, Audiophile-Grade Local Music Player for Android</strong></p>
   <p>
